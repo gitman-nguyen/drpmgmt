@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:13
+    container_name: dr_drill_db
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: dr_drill
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: dr_drill_app
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/dr_drill
+      PORT: 3001
+      NODE_ENV: production
+      CHOKIDAR_USEPOLLING: true
+    volumes:
+      - ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro
+      - ~/.ssh/id_rsa.pub:/root/.ssh/id_rsa.pub:ro
