@@ -5,7 +5,22 @@ const { query } = require('./db');
 const pty = require('node-pty');
 
 const executionClients = new Map(); // Map drillId -> Set of ws clients
-const activeExecutions = new Map(); // Map drillId -> { steps: [], adj: {}, inDegree: {}, currentQueue: [], running: Set<stepId>, failed: boolean }
+
+// --- THAY ĐỔI 1: Cập nhật cấu trúc để chứa 'logs' in-memory và hỗ trợ chạy song song ---
+// Map "drillId_scenarioId" -> { 
+//    steps: [], 
+//    adj: {}, 
+//    inDegree: {}, 
+//    currentQueue: [], 
+//    running: Set<stepId>, 
+//    failed: boolean, 
+//    scenarioId: string, 
+//    logs: Object 
+// }
+const activeExecutions = new Map(); 
+
+// Helper: Tạo key định danh duy nhất cho mỗi phiên chạy kịch bản
+const getExecKey = (drillId, scenarioId) => `${drillId}_${scenarioId}`;
 
 function sendWsMessage(drillId, message) {
     const clients = executionClients.get(drillId);
@@ -22,8 +37,20 @@ function sendWsMessage(drillId, message) {
     }
 }
 
-function findNextSteps(drillId, completedStepId) {
-    const execInfo = activeExecutions.get(drillId);
+// --- NEW FUNCTION: Hàm để Controller gọi lấy log từ bộ nhớ đệm (phục vụ Frontend Lazy Loading) ---
+function getLiveLogs(drillId, scenarioId) {
+    const execKey = getExecKey(drillId, scenarioId);
+    const execInfo = activeExecutions.get(execKey);
+    if (execInfo && execInfo.logs) {
+        return execInfo.logs; // Trả về object { stepId: "log content..." }
+    }
+    return {};
+}
+
+// --- THAY ĐỔI: Nhận scenarioId để tìm đúng hàng đợi ---
+function findNextSteps(drillId, scenarioId, completedStepId) {
+    const execKey = getExecKey(drillId, scenarioId);
+    const execInfo = activeExecutions.get(execKey);
     if (!execInfo) return [];
 
     const nextSteps = [];
@@ -38,18 +65,27 @@ function findNextSteps(drillId, completedStepId) {
                  }
              }
         } else {
-             console.warn(`[Execution ${drillId}]: Step ${vId} not found in inDegree map.`);
+             console.warn(`[Execution ${drillId} - Scen ${scenarioId}]: Step ${vId} not found in inDegree map.`);
         }
     });
     return nextSteps;
 }
 
-async function executeStep(drillId, step) {
-     const execInfo = activeExecutions.get(drillId);
+// --- THAY ĐỔI: Nhận scenarioId để chạy trong context riêng biệt & Fix EIO & Periodic Save ---
+async function executeStep(drillId, scenarioId, step) {
+     const execKey = getExecKey(drillId, scenarioId);
+     const execInfo = activeExecutions.get(execKey);
+     
+     // Kiểm tra context tồn tại và bước này chưa chạy
      if (!execInfo || execInfo.running.has(step.id)) return Promise.resolve(false);
 
      execInfo.running.add(step.id);
-     console.log(`[Execution ${drillId}]: Starting step ${step.id} (${step.title})`);
+     
+     // --- THAY ĐỔI 2: Khởi tạo log trong bộ nhớ ---
+     if (!execInfo.logs) execInfo.logs = {};
+     execInfo.logs[step.id] = '';
+
+     console.log(`[Execution ${drillId}]: Starting step ${step.id} (${step.title}) in scenario ${scenarioId}`);
 
      // --- PHASE 1: START STEP ---
      const startTime = new Date();
@@ -62,7 +98,6 @@ async function executeStep(drillId, step) {
              INSERT INTO execution_steps (drill_id, step_id, status, started_at, assignee, result_text) VALUES ($1, $2, $3, $4, $5, '')
              ON CONFLICT (drill_id, step_id) DO UPDATE SET status = EXCLUDED.status, started_at = EXCLUDED.started_at, assignee = EXCLUDED.assignee, completed_at = NULL, result_text = ''
              RETURNING *;`;
-         // Sửa lỗi: pool.query -> query
          const startDbRes = await query(startQuery, [startPayload.drill_id, startPayload.step_id, startPayload.status, startPayload.started_at, startPayload.assignee]);
          sendWsMessage(drillId, { type: 'STEP_UPDATE', payload: startDbRes.rows[0] });
      } catch(dbError) {
@@ -85,19 +120,20 @@ async function executeStep(drillId, step) {
          console.warn(`[Execution ${drillId}]: Could not fetch default timeout, using 300s.`, e);
      }
 
-     // Logic: Ưu tiên timeout của bước, nếu không có thì dùng timeout mặc định của hệ thống
      const appliedTimeout = defaultTimeout;
      const timeout_ms = appliedTimeout * 1000;
 
      console.log(`[Execution ${drillId}]: Step ${step.id} timeout set to ${appliedTimeout}s`);
 
      let accumulatedLog = '';
+     // --- BIẾN CHO PERIODIC SAVE ---
+     let lastSavedLog = '';
+     let logSaveInterval = null;
 
      if (!command || !server_user || !ip_address) {
          accumulatedLog = "Lỗi cấu hình: Thiếu lệnh, user hoặc IP server.";
          const payload = { drill_id: drillId, step_id: step.id, status: 'Completed-Failure', completed_at: new Date().toISOString(), result_text: accumulatedLog };
          try {
-            // Sửa lỗi: pool.query -> query
             const dbRes = await query(`UPDATE execution_steps SET status = $1, completed_at = $2, result_text = $3 WHERE drill_id = $4 AND step_id = $5 RETURNING *;`, [payload.status, payload.completed_at, payload.result_text, payload.drill_id, payload.step_id]);
             sendWsMessage(drillId, { type: 'STEP_UPDATE', payload: dbRes.rows[0] });
          } catch (dbError) {
@@ -118,8 +154,30 @@ async function executeStep(drillId, step) {
              name: 'xterm-color', cols: 80, rows: 30, cwd: process.env.HOME, env: process.env
          });
 
+         // --- THAY ĐỔI 3: Tăng Interval lưu DB lên 20s (Giảm tải DB, tin cậy vào In-Memory Logs) ---
+         logSaveInterval = setInterval(async () => {
+             if (accumulatedLog !== lastSavedLog && !exitHandled) {
+                 try {
+                     // Chỉ update result_text
+                     await query(`UPDATE execution_steps SET result_text = $1 WHERE drill_id = $2 AND step_id = $3`, 
+                         [accumulatedLog, drillId, step.id]);
+                     lastSavedLog = accumulatedLog;
+                 } catch (e) {
+                     console.error(`[Execution ${drillId}]: Error auto-saving logs for step ${step.id}`, e);
+                 }
+             }
+         }, 20000); // 20 giây
+
          ptyProcess.onData(data => {
              accumulatedLog += data;
+             
+             // --- THAY ĐỔI 4: Cập nhật log vào bộ nhớ đệm (activeExecutions) ---
+             // Điều này giúp getLiveLogs() luôn trả về dữ liệu mới nhất ngay lập tức
+             const currentInfo = activeExecutions.get(execKey);
+             if (currentInfo && currentInfo.logs) {
+                 currentInfo.logs[step.id] = accumulatedLog;
+             }
+
              sendWsMessage(drillId, { type: 'STEP_LOG_UPDATE', payload: { step_id: step.id, log_chunk: data } });
          });
 
@@ -127,15 +185,20 @@ async function executeStep(drillId, step) {
              if (exitHandled) return;
              exitHandled = true;
              clearTimeout(errorTimeout);
+             if (logSaveInterval) clearInterval(logSaveInterval); // Dọn dẹp interval
 
-             const currentExecInfo = activeExecutions.get(drillId);
+             // Lấy lại context dựa trên execKey (drillId + scenarioId)
+             const currentExecInfo = activeExecutions.get(execKey);
         
              if (!currentExecInfo) {
                 console.log(`[Execution ${drillId}]: Execution context removed before step ${step.id} exit handler.`);
-                return reject(new Error(`Execution context removed for step ${step.id}`));
+                // Nếu context bị xóa, không reject để tránh unhandled rejection crash server
+                return resolve(false); 
              }
 
              console.log(`[Execution ${drillId}]: Step ${step.id} exited with code ${exitCode}, signal ${signal}`);
+             
+             // --- SỬA LỖI EIO LOGIC ---
              const success = exitCode === 0;
              const status = success ? 'Completed-Success' : 'Completed-Failure';
              const completed_at = new Date().toISOString();
@@ -147,11 +210,13 @@ async function executeStep(drillId, step) {
                  accumulatedLog += `\nPty Error: ${ptyError.message} (Code: ${ptyError.code})`;
              }
 
+             // Cập nhật lần cuối vào bộ nhớ
+             if (currentExecInfo.logs) currentExecInfo.logs[step.id] = accumulatedLog;
+
              const endPayload = { drill_id: drillId, step_id: step.id, status, completed_at, result_text: accumulatedLog };
 
              try {
                  const endQuery = `UPDATE execution_steps SET status = $1, completed_at = $2, result_text = $3 WHERE drill_id = $4 AND step_id = $5 RETURNING *;`;
-                 // Sửa lỗi: pool.query -> query
                  const endDbRes = await query(endQuery, [endPayload.status, endPayload.completed_at, endPayload.result_text, endPayload.drill_id, endPayload.step_id]);
                  sendWsMessage(drillId, { type: 'STEP_UPDATE', payload: endDbRes.rows[0] });
              } catch (dbError) {
@@ -161,7 +226,8 @@ async function executeStep(drillId, step) {
              currentExecInfo.running.delete(step.id);
 
              if (success) {
-                 const nextSteps = findNextSteps(drillId, step.id);
+                 // Tìm bước tiếp theo trong cùng scenario queue
+                 const nextSteps = findNextSteps(drillId, scenarioId, step.id);
                  if (nextSteps.length > 0) {
                      currentExecInfo.currentQueue.push(...nextSteps);
                  }
@@ -170,71 +236,67 @@ async function executeStep(drillId, step) {
                  const errorMessage = `Execution failed with exit code ${exitCode}. Check logs. ${ptyError ? `(Pty Error: ${ptyError.message})`: ''}`;
                  sendWsMessage(drillId, { type: 'EXECUTION_PAUSED_ON_FAILURE', payload: { step_id: step.id, error: errorMessage, exitCode: exitCode, ptyErrorCode: ptyError?.code } });
                  currentExecInfo.failed = true;
-                 reject(new Error(errorMessage));
+                 resolve(false); 
              }
          });
 
          ptyProcess.on('error', async (err) => {
-             const currentExecInfo = activeExecutions.get(drillId);
              console.error(`[Execution ${drillId}]: Pty process error for step ${step.id} (Command: '${command}'):`, err);
              ptyError = err;
 
-                  if (err.code !== 'EIO' || exitHandled) {
-                        if (exitHandled) {
-                        console.log(`[Execution ${drillId}]: Pty error (Code: ${err.code}) occurred after exit. Ignoring.`);
-                        return;
-                    }
-        
-                    const currentExecInfo = activeExecutions.get(drillId);
-                    console.error(`[Execution ${drillId}]: Pty process error for step ${step.id} (Command: '${command}'):`, err);
-                    ptyError = err;
-        
-                    // SỬA LỖI: Nếu là EIO, chỉ ghi log và để onExit xử lý.
-                    // (Vì EIO là bình thường khi process kết thúc nhanh)
-                    if (err.code === 'EIO') {
-                        console.warn(`[Execution ${drillId}]: Captured EIO error for step ${step.id}. Waiting for exit code or timeout.`);
-                        return; // Không làm gì thêm, không reject promise
-                    }
-                  exitHandled = true;
-                  clearTimeout(errorTimeout);
-
-                 accumulatedLog += `\nCritical Internal Execution Error: ${err.message} (Code: ${err.code}, Syscall: ${err.syscall})`;
-                 const status = 'Completed-Failure';
-                 const completed_at = new Date().toISOString();
-                 const endPayload = { drill_id: drillId, step_id: step.id, status, completed_at, result_text: accumulatedLog };
-                 try {
-                     const endQuery = `UPDATE execution_steps SET status = $1, completed_at = $2, result_text = $3 WHERE drill_id = $4 AND step_id = $5 RETURNING *;`;
-                     // Sửa lỗi: pool.query -> query
-                     const endDbRes = await query(endQuery, [endPayload.status, endPayload.completed_at, endPayload.result_text, endPayload.drill_id, endPayload.step_id]);
-                     sendWsMessage(drillId, { type: 'STEP_UPDATE', payload: endDbRes.rows[0] });
-                 } catch (dbError) {
-                     console.error(`[Execution ${drillId}]: DB Error updating failed pty step ${step.id}:`, dbError);
-                 }
-                  if (currentExecInfo) {
-                     currentExecInfo.running.delete(step.id);
-                     currentExecInfo.failed = true;
-                 }
-                 const detailedError = `Critical internal execution error: ${err.message} (Code: ${err.code})`;
-                 sendWsMessage(drillId, { type: 'EXECUTION_PAUSED_ON_FAILURE', payload: { step_id: step.id, error: detailedError, code: err.code } });
-                 reject(new Error(detailedError));
-             } else {
-                  console.warn(`[Execution ${drillId}]: Captured EIO error for step ${step.id}. Waiting for exit code or timeout.`);
+             // --- FIX QUAN TRỌNG: Xử lý lỗi EIO ---
+             // EIO (Input/output error) thường xảy ra khi process con đóng pipe trước khi node đọc xong.
+             // Nếu lỗi là EIO, ta KHÔNG fail ngay lập tức mà đợi onExit quyết định dựa trên exitCode.
+             if (err.code === 'EIO') {
+                 console.warn(`[Execution ${drillId}]: Captured EIO error for step ${step.id}. Waiting for exit code or timeout.`);
+                 return; 
              }
+
+             if (exitHandled) return;
+             exitHandled = true;
+             clearTimeout(errorTimeout);
+             if (logSaveInterval) clearInterval(logSaveInterval);
+
+             const currentExecInfo = activeExecutions.get(execKey); 
+             accumulatedLog += `\nCritical Internal Execution Error: ${err.message} (Code: ${err.code}, Syscall: ${err.syscall})`;
+             const status = 'Completed-Failure';
+             const completed_at = new Date().toISOString();
+             
+             const endPayload = { drill_id: drillId, step_id: step.id, status, completed_at, result_text: accumulatedLog };
+             try {
+                 const endQuery = `UPDATE execution_steps SET status = $1, completed_at = $2, result_text = $3 WHERE drill_id = $4 AND step_id = $5 RETURNING *;`;
+                 const endDbRes = await query(endQuery, [endPayload.status, endPayload.completed_at, endPayload.result_text, endPayload.drill_id, endPayload.step_id]);
+                 sendWsMessage(drillId, { type: 'STEP_UPDATE', payload: endDbRes.rows[0] });
+             } catch (dbError) {
+                 console.error(`[Execution ${drillId}]: DB Error updating failed pty step ${step.id}:`, dbError);
+             }
+             
+             if (currentExecInfo) {
+                 currentExecInfo.running.delete(step.id);
+                 currentExecInfo.failed = true;
+             }
+             
+             const detailedError = `Critical internal execution error: ${err.message} (Code: ${err.code})`;
+             sendWsMessage(drillId, { type: 'EXECUTION_PAUSED_ON_FAILURE', payload: { step_id: step.id, error: detailedError, code: err.code } });
+             reject(new Error(detailedError));
         });
 
          errorTimeout = setTimeout(() => {
              if (exitHandled) return;
              exitHandled = true;
-             const currentExecInfo = activeExecutions.get(drillId);
-             const errorMessage = ptyError ? `Step ${step.id} timed out after error: ${ptyError.message}` : `Step ${step.id} timed out after ${timeout_ms / 1000}s without exiting.`;
+             if (logSaveInterval) clearInterval(logSaveInterval);
+
+             const currentExecInfo = activeExecutions.get(execKey);
+             const errorMessage = ptyError 
+                ? `Step ${step.id} timed out after error warning: ${ptyError.message}` 
+                : `Step ${step.id} timed out after ${timeout_ms / 1000}s without exiting.`;
              console.warn(`[Execution ${drillId}]: ${errorMessage}`);
 
              accumulatedLog += `\nError: ${errorMessage}`;
              const status = 'Completed-Failure';
              const completed_at = new Date().toISOString();
              const endPayload = { drill_id: drillId, step_id: step.id, status, completed_at, result_text: accumulatedLog };
-
-             // Sửa lỗi: pool.query -> query
+             
              query(`UPDATE execution_steps SET status = $1, completed_at = $2, result_text = $3 WHERE drill_id = $4 AND step_id = $5 RETURNING *;`,
                  [endPayload.status, endPayload.completed_at, endPayload.result_text, endPayload.drill_id, endPayload.step_id]
              ).then(endDbRes => {
@@ -249,28 +311,33 @@ async function executeStep(drillId, step) {
                  sendWsMessage(drillId, { type: 'EXECUTION_PAUSED_ON_FAILURE', payload: { step_id: step.id, error: errorMessage, timedOut: true } });
                  reject(new Error(errorMessage));
              });
-         }, timeout_ms); // 5 minutes timeout
+         }, timeout_ms);
      });
 }
 
-async function processExecutionQueue(drillId) {
-    const execInfo = activeExecutions.get(drillId);
+// --- THAY ĐỔI: Nhận scenarioId ---
+async function processExecutionQueue(drillId, scenarioId) {
+    const execKey = getExecKey(drillId, scenarioId);
+    const execInfo = activeExecutions.get(execKey);
+    
     if (!execInfo) {
-        console.log(`[Execution ${drillId}]: Execution stopped or context removed.`);
+        // console.log(`[Execution ${drillId}]: Execution stopped or context removed for scenario ${scenarioId}.`);
         return;
     }
     if (execInfo.failed) {
-        console.log(`[Execution ${drillId}]: Execution paused due to previous error. Halting queue processing.`);
+        // console.log(`[Execution ${drillId}]: Execution paused due to previous error. Halting queue processing.`);
         return;
     }
 
     if (execInfo.currentQueue.length === 0) {
         if(execInfo.running.size === 0 && !execInfo.failed) {
-            console.log(`[Execution ${drillId}]: Queue empty and no steps running. Execution complete.`);
-            sendWsMessage(drillId, { type: 'EXECUTION_COMPLETE', payload: {} });
-            activeExecutions.delete(drillId);
+            console.log(`[Execution ${drillId} - Scen ${scenarioId}]: Queue empty and no steps running. Execution complete.`);
+            
+            // Chỉ xóa execution của scenario này
+            sendWsMessage(drillId, { type: 'EXECUTION_COMPLETE', payload: { scenario_id: scenarioId } });
+            activeExecutions.delete(execKey);
         } else if (execInfo.running.size > 0) {
-             console.log(`[Execution ${drillId}]: Queue empty but ${execInfo.running.size} steps still running.`);
+             // console.log(`[Execution ${drillId}]: Queue empty but ${execInfo.running.size} steps still running.`);
         }
         return;
     }
@@ -278,26 +345,28 @@ async function processExecutionQueue(drillId) {
     const stepsToRun = [...execInfo.currentQueue];
     execInfo.currentQueue = [];
 
-    sendWsMessage(drillId, { type: 'LEVEL_START', payload: { step_ids: stepsToRun.map(s => s.id) } });
+    // Gửi kèm scenario_id trong payload để Frontend lọc
+    sendWsMessage(drillId, { type: 'LEVEL_START', payload: { step_ids: stepsToRun.map(s => s.id), scenario_id: scenarioId } });
 
     try {
-        await Promise.all(stepsToRun.map(step => executeStep(drillId, step)));
+        // Truyền scenarioId vào executeStep
+        await Promise.all(stepsToRun.map(step => executeStep(drillId, scenarioId, step)));
 
-        const currentExecInfo = activeExecutions.get(drillId);
+        const currentExecInfo = activeExecutions.get(execKey);
         if (currentExecInfo && !currentExecInfo.failed) {
             if (currentExecInfo.currentQueue.length === 0 && currentExecInfo.running.size === 0) {
-                processExecutionQueue(drillId);
+                processExecutionQueue(drillId, scenarioId);
             } else if (currentExecInfo.currentQueue.length > 0) {
-                processExecutionQueue(drillId);
+                processExecutionQueue(drillId, scenarioId);
             }
         } else if (currentExecInfo && currentExecInfo.failed) {
             console.log(`[Execution ${drillId}]: Execution paused after processing level due to failure.`);
         } else {
-             console.log(`[Execution ${drillId}]: Execution stopped externally after processing level.`);
+             // console.log(`[Execution ${drillId}]: Execution stopped externally after processing level.`);
         }
     } catch (error) {
         console.error(`[Execution ${drillId}]: Error processing execution level:`, error.message || error);
-        const currentExecInfo = activeExecutions.get(drillId);
+        const currentExecInfo = activeExecutions.get(execKey);
         if (currentExecInfo) {
              currentExecInfo.failed = true;
              console.log(`[Execution ${drillId}]: Marked execution as failed.`);
@@ -305,26 +374,28 @@ async function processExecutionQueue(drillId) {
     }
 }
 
+// --- THAY ĐỔI 5: Logic startOrResumeExecution cho song song ---
 async function startOrResumeExecution(drillId, stepsToRunIds, scenarioId) {
     try {
-        const existingExec = activeExecutions.get(drillId);
-        if (existingExec && !existingExec.failed) {
-             console.warn(`[Execution ${drillId}]: Attempted to start execution while already active and not failed. Ignoring.`);
-             return;
-        }
-
         if (!scenarioId) {
-             // Sửa lỗi: pool.query -> query (Đây là dòng 285 gây lỗi)
              const scenarioIdRes = await query('SELECT scenario_id FROM steps WHERE id = $1', [stepsToRunIds[0]]);
              if (scenarioIdRes.rows.length === 0) throw new Error(`Scenario not found for step ${stepsToRunIds[0]}`);
              scenarioId = scenarioIdRes.rows[0].scenario_id;
         }
 
-        // Sửa lỗi: pool.query -> query
+        // Key duy nhất cho kịch bản này
+        const execKey = getExecKey(drillId, scenarioId);
+        const existingExec = activeExecutions.get(execKey);
+
+        // Chỉ chặn nếu CHÍNH KỊCH BẢN NÀY đang chạy. Các kịch bản khác thoải mái.
+        if (existingExec && !existingExec.failed) {
+             console.warn(`[Execution ${drillId}]: Attempted to start Scenario ${scenarioId} while already active. Rejecting request.`);
+             throw new Error("EXECUTION_ALREADY_ACTIVE"); 
+        }
+
         const stepsRes = await query(`SELECT s.*, ms.ip_address FROM steps s LEFT JOIN managed_servers ms ON s.server_id = ms.id WHERE s.scenario_id = $1 ORDER BY s.step_order`, [scenarioId]);
         const allStepsInScenario = stepsRes.rows;
         const allStepIds = allStepsInScenario.map(s => s.id);
-        // Sửa lỗi: pool.query -> query
         const depsRes = await query('SELECT * FROM step_dependencies WHERE step_id = ANY($1::text[]) OR depends_on_step_id = ANY($1::text[])', [allStepIds]);
         const dependencies = depsRes.rows;
 
@@ -344,7 +415,6 @@ async function startOrResumeExecution(drillId, stepsToRunIds, scenarioId) {
         let initialQueue = [];
         const currentInDegreeForRun = { ...originalInDegree };
 
-        // Sửa lỗi: pool.query -> query
         const executionStepsStatusRes = await query('SELECT step_id, status from execution_steps where drill_id = $1 AND step_id = ANY($2::text[])', [drillId, allStepIds]);
         const currentStepStatuses = executionStepsStatusRes.rows.reduce((acc, row) => {
              acc[row.step_id] = row.status;
@@ -355,11 +425,8 @@ async function startOrResumeExecution(drillId, stepsToRunIds, scenarioId) {
             if (stepsToRunIds.includes(s.id)) {
                 dependencies.forEach(dep => {
                     if (dep.step_id === s.id && !stepsToRunIds.includes(dep.depends_on_step_id)) {
-                         // --- START: SỬA LOGIC GHI ĐÈ BƯỚC ---
-                         // Cho phép 'Completed-Skipped' giống như 'Completed-Success'
                          const depStatus = currentStepStatuses[dep.depends_on_step_id];
                          if (depStatus === 'Completed-Success' || depStatus === 'Completed-Skipped') {
-                         // --- END: SỬA LOGIC GHI ĐÈ BƯỚC ---
                             if(currentInDegreeForRun[s.id] > 0) currentInDegreeForRun[s.id]--;
                          }
                     }
@@ -372,59 +439,68 @@ async function startOrResumeExecution(drillId, stepsToRunIds, scenarioId) {
          );
 
          if (existingExec) {
-             console.log(`[Execution ${drillId}]: Resuming/Retrying. Updating context.`);
+             console.log(`[Execution ${drillId}]: Resuming/Retrying Scenario ${scenarioId}.`);
              existingExec.currentQueue = initialQueue;
              existingExec.failed = false;
              existingExec.inDegree = { ...originalInDegree };
              
              allStepsInScenario.forEach(s => {
-                if(activeExecutions.get(drillId)?.inDegree[s.id] > 0) {
+                if(activeExecutions.get(execKey)?.inDegree[s.id] > 0) {
                      dependencies.forEach(dep => {
-                        // --- START: SỬA LOGIC GHI ĐÈ BƯỚC ---
                         const depStatus = currentStepStatuses[dep.depends_on_step_id];
                         if (dep.step_id === s.id && !stepsToRunIds.includes(dep.depends_on_step_id) && (depStatus === 'Completed-Success' || depStatus === 'Completed-Skipped')) {
-                        // --- END: SỬA LOGIC GHI ĐÈ BƯỚC ---
-                            activeExecutions.get(drillId).inDegree[s.id]--;
+                            activeExecutions.get(execKey).inDegree[s.id]--;
                         }
                     });
                 }
              });
          } else {
-             activeExecutions.set(drillId, {
+             // Tạo context mới cho kịch bản này
+             activeExecutions.set(execKey, {
                  steps: allStepsInScenario,
                  adj: adj,
                  inDegree: { ...originalInDegree },
                  currentQueue: initialQueue,
                  running: new Set(),
-                 failed: false
+                 failed: false,
+                 scenarioId: scenarioId, // Lưu scenarioId vào context
+                 logs: {} // Init logs
              });
          }
 
-
-        console.log(`[Execution ${drillId}]: Starting/Resuming. Initial queue:`, initialQueue.map(s => s.id));
-        processExecutionQueue(drillId);
+        console.log(`[Execution ${drillId}]: Starting Scenario ${scenarioId}. Initial queue:`, initialQueue.map(s => s.id));
+        processExecutionQueue(drillId, scenarioId);
 
     } catch (err) {
          console.error(`[Execution ${drillId}]: Error preparing execution:`, err);
+         if (err.message === "EXECUTION_ALREADY_ACTIVE") throw err;
+
          sendWsMessage(drillId, { type: 'EXECUTION_ERROR', payload: { error: `Failed to prepare execution: ${err.message}` } });
-         activeExecutions.delete(drillId);
+         // Xóa đúng context của kịch bản này nếu lỗi
+         if (scenarioId) activeExecutions.delete(getExecKey(drillId, scenarioId));
+         throw err; // Ném lỗi ra để API trả về 500
     }
 }
 
-// --- START: THÊM TÍNH NĂNG GHI ĐÈ BƯỚC ---
-/**
- * Ghi đè trạng thái của một bước bằng tay và kích hoạt các bước tiếp theo nếu cần.
- * @param {string} drillId ID của drill
- * @param {string} stepId ID của bước cần ghi đè
- * @param {string} newStatus Trạng thái mới ('Completed-Success', 'Completed-Skipped', 'Completed-Failure')
- * @param {string} reason Lý do ghi đè (sẽ được lưu vào result_text)
- */
+// Helper để tìm context đang chứa bước này
+function findExecutionKeyByStepId(drillId, stepId) {
+    for (const [key, execInfo] of activeExecutions.entries()) {
+        // Kiểm tra xem key có thuộc drill này không
+        if (key.startsWith(`${drillId}_`)) {
+            // Kiểm tra xem bước này có trong danh sách steps của context không
+            if (execInfo.steps.some(s => s.id === stepId)) {
+                return { key, execInfo };
+            }
+        }
+    }
+    return null;
+}
+
 async function manuallyCompleteStep(drillId, stepId, newStatus, reason) {
     console.log(`[Execution ${drillId}]: Manually overriding step ${stepId} to ${newStatus}. Reason: ${reason}`);
     
     const completed_at = new Date().toISOString();
     
-    // 1. Cập nhật cơ sở dữ liệu
     const endQuery = `
         INSERT INTO execution_steps (drill_id, step_id, status, completed_at, result_text, assignee) 
         VALUES ($1, $2, $3, $4, $5, 'MANUAL_OVERRIDE')
@@ -438,77 +514,55 @@ async function manuallyCompleteStep(drillId, stepId, newStatus, reason) {
     const endDbRes = await query(endQuery, [drillId, stepId, newStatus, completed_at, reason]);
     const updatedStep = endDbRes.rows[0];
 
-    // 2. Gửi cập nhật qua WebSocket
     sendWsMessage(drillId, { type: 'STEP_UPDATE', payload: updatedStep });
 
-    // 3. Xử lý logic hàng đợi (queue) nếu thực thi đang chạy
-    const execInfo = activeExecutions.get(drillId);
-    if (execInfo) {
-        // Xóa khỏi danh sách đang chạy (nếu lỡ có)
-        execInfo.running.delete(stepId);
+    // TÌM ĐÚNG CONTEXT (QUEUE) ĐANG CHỨA BƯỚC NÀY
+    const found = findExecutionKeyByStepId(drillId, stepId);
 
-        // Nếu trạng thái là "thành công" (hoặc bỏ qua), hãy kích hoạt các bước tiếp theo
+    if (found) {
+        const { key, execInfo } = found;
+        const scenarioId = execInfo.scenarioId;
+
+        execInfo.running.delete(stepId);
         if (newStatus === 'Completed-Success' || newStatus === 'Completed-Skipped') {
-            
-            // --- START: SỬA LỖI LOGIC (FIX-QUEUE-ON-OVERRIDE) ---
-            // Nếu chúng ta ghi đè một bước bị lỗi thành công,
-            // hãy đặt lại cờ 'failed' để queue có thể tiếp tục.
             if (execInfo.failed) {
-                console.log(`[Execution ${drillId}]: Đặt lại cờ 'failed' do ghi đè thủ công.`);
+                console.log(`[Execution ${drillId} - Scen ${scenarioId}]: Resetting failed flag due to manual override.`);
                 execInfo.failed = false;
             }
-            // --- END: SỬA LỖI LOGIC (FIX-QUEUE-ON-OVERRIDE) ---
-
-            const nextSteps = findNextSteps(drillId, stepId);
+            const nextSteps = findNextSteps(drillId, scenarioId, stepId);
             if (nextSteps.length > 0) {
-                console.log(`[Execution ${drillId}]: Queuing next steps after override:`, nextSteps.map(s => s.id));
                 execInfo.currentQueue.push(...nextSteps);
             }
-            
-            // Kích hoạt xử lý hàng đợi để chạy các bước tiếp theo
-            // Hàm này bây giờ sẽ chạy vì cờ 'failed' đã được dọn dẹp (nếu cần)
-            processExecutionQueue(drillId);
-
+            // Chạy tiếp queue của đúng kịch bản đó
+            processExecutionQueue(drillId, scenarioId);
         } else if (newStatus === 'Completed-Failure') {
-            // Nếu ép "thất bại", đánh dấu toàn bộ execution là failed
             execInfo.failed = true;
             sendWsMessage(drillId, { type: 'EXECUTION_PAUSED_ON_FAILURE', payload: { step_id: stepId, error: reason, manualOverride: true } });
         }
     }
-
     return updatedStep;
 }
-// --- END: THÊM TÍNH NĂNG GHI ĐÈ BƯỚC ---
 
-// --- START: SỬA LỖI API (FIX LỖI 404 - execution/step) ---
-/**
- * Cập nhật trạng thái của một bước thủ công (Start, Complete-Success, Complete-Failure)
- * @param {object} body Dữ liệu từ request body
- */
 async function updateManualStep(body) {
     const { drill_id, step_id, status, started_at, completed_at, result_text, assignee } = body;
     
     console.log(`[Execution Logic] Cập nhật bước ${step_id} cho drill ${drill_id} với trạng thái ${status}`);
 
     if (!drill_id || !step_id || !status) {
-        // Ném lỗi để controller có thể bắt và trả về 400
         throw new Error('Yêu cầu thiếu drill_id, step_id, hoặc status.');
     }
     
-    // 1. Kiểm tra xem bản ghi đã tồn tại chưa
     const checkQuery = 'SELECT * FROM execution_steps WHERE drill_id = $1 AND step_id = $2';
     const checkRes = await query(checkQuery, [drill_id, step_id]);
     
     let updatedStep;
 
     if (checkRes.rows.length > 0) {
-        // 2. Tồn tại -> Cập nhật (UPDATE)
         const existing = checkRes.rows[0];
         const newStatus = status;
         const newStartedAt = started_at || existing.started_at;
-        // Quan trọng: Nếu bắt đầu ('InProgress'), 'completed_at' và 'result_text' phải là null
         const newCompletedAt = (status === 'InProgress') ? null : (completed_at || existing.completed_at);
-        const newResultText = (status === 'InProgress') ? null : (result_text !== undefined ? result_text : existing.result_text); // Cho phép ''
+        const newResultText = (status === 'InProgress') ? null : (result_text !== undefined ? result_text : existing.result_text);
         const newAssignee = assignee || existing.assignee;
 
         const updateQuery = `
@@ -521,7 +575,6 @@ async function updateManualStep(body) {
         updatedStep = updateRes.rows[0];
         console.log(`[Execution Logic] Đã CẬP NHẬT bước ${step_id}`);
     } else {
-        // 2. Chưa tồn tại -> Chèn mới (INSERT)
         const insertQuery = `
             INSERT INTO execution_steps (drill_id, step_id, status, started_at, completed_at, result_text, assignee)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -532,22 +585,14 @@ async function updateManualStep(body) {
         console.log(`[Execution Logic] Đã CHÈN MỚI bước ${step_id}`);
     }
 
-    // 3. Gửi thông báo WebSocket
     sendWsMessage(drill_id, {
         type: 'STEP_UPDATE',
         payload: updatedStep
     });
 
-    // 4. Trả về step đã cập nhật để controller có thể gửi lại
     return updatedStep;
 }
-// --- END: SỬA LỖI API (FIX LỖI 404 - execution/step) ---
 
-// --- START: SỬA LỖI API (FIX LỖI 404 - execution/scenario) ---
-/**
- * Xác nhận trạng thái cuối cùng của một kịch bản (thường là thủ công)
- * @param {object} body Dữ liệu từ request body
- */
 async function confirmScenarioStatus(body) {
     const { drill_id, scenario_id, final_status, final_reason } = body;
 
@@ -569,25 +614,18 @@ async function confirmScenarioStatus(body) {
     const dbRes = await query(queryCmd, [drill_id, scenario_id, final_status, final_reason]);
     const updatedScenarioExec = dbRes.rows[0];
 
-    // Gửi thông báo WebSocket
     sendWsMessage(drill_id, {
         type: 'SCENARIO_UPDATE',
         payload: {
-            ...updatedScenarioExec, // Gửi toàn bộ object từ DB
-            id: updatedScenarioExec.scenario_id, // Đảm bảo có 'id'
-            type: 'scenario' // Thêm 'type' để UI biết
+            ...updatedScenarioExec,
+            id: updatedScenarioExec.scenario_id,
+            type: 'scenario'
         }
     });
 
     return updatedScenarioExec;
 }
-// --- END: SỬA LỖI API (FIX LỖI 404 - execution/scenario) ---
 
-// --- START: THÊM API (FIX LỖI 404 - execution/checkpoint) ---
-/**
- * Đánh giá một tiêu chí (criterion) của checkpoint
- * @param {object} body Dữ liệu từ request body
- */
 async function evaluateCheckpointCriterion(body) {
     const { drill_id, criterion_id, status, checked_by } = body;
 
@@ -597,8 +635,6 @@ async function evaluateCheckpointCriterion(body) {
 
     console.log(`[Execution Logic] Đánh giá tiêu chí ${criterion_id} cho drill ${drill_id} là ${status}`);
 
-    // Giả định tên bảng là 'execution_criteria'.
-    // Nếu tên bảng của bạn khác, hãy thay đổi nó ở đây.
     const queryCmd = `
         INSERT INTO execution_checkpoint_criteria (drill_id, criterion_id, status, checked_at, checked_by)
         VALUES ($1, $2, $3, NOW(), $4)
@@ -612,16 +648,13 @@ async function evaluateCheckpointCriterion(body) {
     const dbRes = await query(queryCmd, [drill_id, criterion_id, status, checked_by]);
     const updatedCriterion = dbRes.rows[0];
 
-    // Gửi thông báo WebSocket
     sendWsMessage(drill_id, {
-        type: 'CRITERION_UPDATE', // Một type mới
+        type: 'CRITERION_UPDATE',
         payload: updatedCriterion
     });
 
     return updatedCriterion;
 }
-// --- END: THÊM API (FIX LỖI 404 - execution/checkpoint) ---
-
 
 module.exports = {
     executionClients,
@@ -634,5 +667,6 @@ module.exports = {
     manuallyCompleteStep, 
     updateManualStep,      
     confirmScenarioStatus,
-    evaluateCheckpointCriterion // <-- THÊM HÀM MỚI VÀO EXPORTS
+    evaluateCheckpointCriterion,
+    getLiveLogs // Export thêm hàm này
 };

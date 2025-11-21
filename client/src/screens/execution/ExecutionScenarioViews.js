@@ -102,7 +102,19 @@ export const RefreshControls = ({ refreshInterval, setRefreshInterval, onRefresh
     );
 };
 
-export const ScenarioWorkflowView = ({ scenario, steps, getStepState, autoRunState, t, onStepSelect, selectedStepId }) => {
+// --- SỬA ĐỔI: Thêm props drill, userAvatarLabels, userColorMap ---
+export const ScenarioWorkflowView = ({ 
+    scenario, 
+    steps, 
+    getStepState, 
+    autoRunState, 
+    t, 
+    onStepSelect, 
+    selectedStepId,
+    drill,              // Prop mới: Thông tin drill (chứa assignments)
+    userAvatarLabels,   // Prop mới: Map tên hiển thị (Hoan, Anh...)
+    userColorMap        // Prop mới: Map màu avatar
+}) => {
     const stepLevels = useMemo(() => {
         if (!scenario || !scenario.steps || !steps) return [];
         const scenarioSteps = scenario.steps.map(id => steps[id]).filter(Boolean);
@@ -186,15 +198,28 @@ export const ScenarioWorkflowView = ({ scenario, steps, getStepState, autoRunSta
                                     bgColor = 'bg-yellow-50';
                                 }
 
+                                // --- AVATAR LOGIC ---
+                                const assigneeId = drill?.step_assignments?.[step.id];
+                                const hasAssignee = !!assigneeId;
+                                const avatarLabel = hasAssignee && userAvatarLabels ? (userAvatarLabels[assigneeId] || '?') : null;
+                                const avatarColorClass = hasAssignee && userColorMap ? (userColorMap[assigneeId] || 'bg-gray-400') : 'bg-gray-200';
+
                                 return (
                                     <button
                                         key={step.id}
                                         onClick={() => onStepSelect(step.id)}
-                                        className={`p-3 rounded-lg border-l-4 w-64 text-left transition-all duration-300 ${borderColor} ${bgColor} ${isRunning ? 'animate-pulse' : ''} ${isSelected ? 'ring-2 ring-sky-500 shadow-lg' : 'shadow-md hover:shadow-lg'}`}
+                                        className={`p-3 rounded-lg border-l-4 w-64 text-left transition-all duration-300 relative ${borderColor} ${bgColor} ${isRunning ? 'animate-pulse' : ''} ${isSelected ? 'ring-2 ring-sky-500 shadow-lg' : 'shadow-md hover:shadow-lg'}`}
                                     >
                                         <div className="flex items-center gap-3">
                                             <span className="flex-shrink-0">{statusIcon}</span>
-                                            <h4 className="font-semibold text-sm text-gray-800 flex-1">{step.title}</h4>
+                                            <h4 className="font-semibold text-sm text-gray-800 flex-1 truncate" title={step.title}>{step.title}</h4>
+                                            
+                                            {/* --- HIỂN THỊ AVATAR --- */}
+                                            {hasAssignee && (
+                                                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-bold flex-shrink-0 ${avatarColorClass}`} title={`Assigned to: ${avatarLabel}`}>
+                                                    {avatarLabel}
+                                                </div>
+                                            )}
                                         </div>
                                     </button>
                                 );
@@ -214,7 +239,7 @@ export const StepDetailView = ({ step, state, liveLog, onClose, t, onOverrideSte
         if (logContainerRef.current) {
             logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
         }
-    }, [liveLog]);
+    }, [liveLog, state.result_text]); // Thêm state.result_text vào dependencies
 
     if (!step || !state) return null;
 
@@ -263,7 +288,13 @@ export const StepDetailView = ({ step, state, liveLog, onClose, t, onOverrideSte
                     <p className="font-semibold text-gray-700 text-sm">Kết quả (Log):</p>
                     <div ref={logContainerRef} className="mt-1 p-3 bg-gray-900 text-white text-xs rounded-md font-mono max-h-80 overflow-y-auto">
                         <pre className="whitespace-pre-wrap break-words"><code>
-                            {displayLog || (isRunning ? 'Đang chạy...' : (state.status === 'InProgress' ? 'Đang chạy...' : 'Không có output.'))}
+                            {/* Ưu tiên hiển thị log nếu có, nếu không mới hiện text mặc định */}
+                            {displayLog 
+                                ? displayLog 
+                                : (isRunning 
+                                    ? (state.status === 'InProgress' ? 'Đang chạy...' : 'Đang chờ log...') 
+                                    : (state.status === 'InProgress' ? 'Đang chạy...' : 'Không có output.'))
+                            }
                         </code></pre>
                     </div>
                 </div>

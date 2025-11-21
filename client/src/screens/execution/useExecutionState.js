@@ -10,7 +10,9 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
     const [activeNodeId, setActiveNodeId] = useState(null);
     const [completionModal, setCompletionModal] = useState(null);
     const [selectedStepId, setSelectedStepId] = useState(null);
+    
     const [isAutoRunning, setIsAutoRunning] = useState(false);
+    
     const [autoRunState, setAutoRunState] = useState({ runningSteps: [] });
     const [failedStepInfo, setFailedStepInfo] = useState(null); 
     const [rerunModalOpen, setRerunModalOpen] = useState(false);
@@ -25,7 +27,28 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
     const [refreshInterval, setRefreshInterval] = useState(0); 
     const [allUsers, setAllUsers] = useState([]);
 
-    // --- Data Fetching ---
+    const [loadedScenarioIds, setLoadedScenarioIds] = useState(new Set());
+    const [isLoadingDetails, setIsLoadingDetails] = useState(false);
+
+    const stepsRef = useRef(steps);
+    const activeNodeRef = useRef(activeNodeId);
+
+    useEffect(() => { stepsRef.current = steps; }, [steps]);
+    
+    // --- Xử lý khi chuyển Scenario ---
+    useEffect(() => {
+        activeNodeRef.current = activeNodeId;
+        
+        // FIX: KHÔNG xóa liveLogs khi chuyển tab
+        setSelectedStepId(null);
+
+        // Tải lại chi tiết để đồng bộ log từ Backend
+        if (activeNodeId && allNodes[activeNodeId]?.nodeType === 'scenario') {
+            fetchScenarioDetails(activeNodeId);
+        }
+    }, [activeNodeId]); 
+
+    // --- Data Fetching (INITIAL LOAD) ---
     const fetchExecutionData = useCallback(async () => {
         if (!drillId) {
             setError("Không có ID diễn tập nào được cung cấp.");
@@ -37,11 +60,7 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
         try {
             const [drillRes, scenariosRes, stepsRes] = await Promise.all([
                 fetch(`/api/data/drills/${drillId}`), 
-                // --- SỬA LỖI ---
-                // Endpoint '/api/ops/scenarios' trả về object phân trang {data: [], pagination: {}}
-                // Endpoint '/api/ops/scenarios/all' trả về mảng [], đúng như logic .reduce() mong đợi.
-                fetch('/api/ops/scenarios/all'), // <-- ĐÃ SỬA TỪ '/api/ops/scenarios'
-                // Endpoint '/api/ops/steps' đã trả về mảng, không cần sửa
+                fetch('/api/ops/scenarios/all'), 
                 fetch('/api/ops/steps')
             ]);
             if (!drillRes.ok) throw new Error(`Không thể tải drill: ${await drillRes.text()}`);
@@ -49,22 +68,36 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             if (!stepsRes.ok) throw new Error(`Không thể tải steps: ${await stepsRes.text()}`);
             
             const drillData = await drillRes.json();
-            
-            // allScenariosArray bây giờ sẽ là một mảng, lỗi .reduce() sẽ được khắc phục
             const allScenariosArray = await scenariosRes.json(); 
             const allStepsArray = await stepsRes.json();
             
-            // Dòng 49 (theo logic file) sẽ không còn lỗi
             const scenariosMap = allScenariosArray.reduce((acc, scen) => { acc[scen.id] = scen; return acc; }, {});
             const stepsMap = allStepsArray.reduce((acc, step) => { acc[step.id] = step; return acc; }, {});
             
+            const execData = drillData.executionData || {};
+
             setDrill(drillData.drill);
-            setExecutionData(drillData.executionData || {});
+            setExecutionData(execData);
             setScenarios(scenariosMap);
             setSteps(stepsMap);
             setAllUsers(drillData.users || []);
+
+            const runningStepIds = [];
+            if (execData[drillData.drill.id]) {
+                Object.entries(execData[drillData.drill.id]).forEach(([stepId, data]) => {
+                    if (data && data.status === 'InProgress') {
+                        runningStepIds.push(stepId);
+                    }
+                });
+            }
+            if (runningStepIds.length > 0) {
+                setAutoRunState(prev => ({
+                    ...prev,
+                    runningSteps: [...new Set([...prev.runningSteps, ...runningStepIds])]
+                }));
+            }
+
         } catch (err) {
-            // Dòng 57 (theo logic file)
             console.error("Failed to fetch execution data:", err);
             setError(`Không thể tải dữ liệu diễn tập: ${err.message}`);
         } finally {
@@ -76,29 +109,107 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
         fetchExecutionData();
     }, [fetchExecutionData]);
 
+    // --- Lazy Load Logic ---
+    const onExecutionUpdate = useCallback((drillId, entityId, newData) => {
+        setExecutionData(prevExecData => {
+            const newDrillData = { ...(prevExecData[drillId] || {}) };
+            if (entityId === null && typeof newData === 'object') {
+                Object.assign(newDrillData, newData);
+            } else {
+                newDrillData[entityId] = newData;
+            }
+            return { ...prevExecData, [drillId]: newDrillData };
+        });
+    }, []);
+
+    const fetchScenarioDetails = useCallback(async (scenarioId) => {
+        setIsLoadingDetails(true);
+        try {
+            const response = await fetch(`/api/data/drills/${drillId}/scenarios/${scenarioId}/details`);
+            if (response.ok) {
+                const detailsData = await response.json();
+                onExecutionUpdate(drillId, null, detailsData);
+                setLoadedScenarioIds(prev => new Set(prev).add(scenarioId));
+
+                setLiveLogs(prevLogs => {
+                    const newLogs = { ...prevLogs };
+                    let hasChanges = false;
+                    Object.entries(detailsData).forEach(([stepId, stepData]) => {
+                        if (stepData.result_text && (!newLogs[stepId] || newLogs[stepId].length < stepData.result_text.length)) {
+                            newLogs[stepId] = stepData.result_text;
+                            hasChanges = true;
+                        }
+                    });
+                    return hasChanges ? newLogs : prevLogs;
+                });
+
+            } else {
+                console.warn("Failed to load details.");
+            }
+        } catch (err) {
+            console.error(`Error loading scenario ${scenarioId}:`, err);
+        } finally {
+            setIsLoadingDetails(false);
+        }
+    }, [drillId, onExecutionUpdate]);
+
+
     const handleRefresh = useCallback(() => {
-        // SỬA LỖI: Thêm kiểm tra !isAutoRunning
-        if (!isLoading && !isAutoRunning) {
-            setLiveLogs({});
+        if (!isLoading) {
             fetchExecutionData();
         }
-    }, [fetchExecutionData, isLoading, isAutoRunning]); // Thêm isAutoRunning
+    }, [fetchExecutionData, isLoading]);
 
     useEffect(() => {
-        if (refreshInterval > 0 && !isAutoRunning) {
+        if (refreshInterval > 0) {
             const intervalId = setInterval(handleRefresh, refreshInterval);
             return () => clearInterval(intervalId);
         }
-    }, [refreshInterval, handleRefresh, isAutoRunning]);
+    }, [refreshInterval, handleRefresh]);
 
-    useEffect(() => {
-        setSelectedStepId(null);
-    }, [activeNodeId]);
 
-    // --- Memos (Tính toán dữ liệu) ---
+    // --- Memos ---
     const userColorMap = useMemo(() => {
         const map = {};
         if (allUsers && allUsers.length > 0) { allUsers.forEach(u => { map[u.id] = userColorClasses[simpleHash(u.id) % userColorClasses.length]; }); }
+        return map;
+    }, [allUsers]);
+
+    // --- FIX: Logic hiển thị Tên (Last Name) cải tiến ---
+    const userAvatarLabels = useMemo(() => {
+        const map = {};
+        if (allUsers && allUsers.length > 0) { 
+            allUsers.forEach(u => { 
+                let label = '?';
+                
+                // Hàm helper lấy từ cuối cùng
+                const getLastWord = (str) => {
+                    if (!str || typeof str !== 'string') return '';
+                    const parts = str.trim().split(/\s+/);
+                    return parts.length > 0 ? parts[parts.length - 1] : '';
+                };
+
+                // Ưu tiên 1: Lấy từ cuối của first_name (Ví dụ: "Hoàng Chi" -> "Chi")
+                if (u.first_name && u.first_name.trim() !== '') {
+                    label = getLastWord(u.first_name);
+                } 
+                // Ưu tiên 2: Lấy từ cuối của fullname (Ví dụ: "Nguyễn Hoàng Chi" -> "Chi")
+                else if (u.fullname && u.fullname.trim() !== '') {
+                    label = getLastWord(u.fullname);
+                } 
+                // Ưu tiên 3: Lấy từ cuối của last_name (nếu dữ liệu bị ngược)
+                else if (u.last_name && u.last_name.trim() !== '') {
+                    label = getLastWord(u.last_name);
+                }
+                // Ưu tiên 4: Lấy username
+                else if (u.username) {
+                    label = u.username.charAt(0);
+                }
+
+                // Đảm bảo không rỗng và viết hoa
+                map[u.id] = (label || '?').toUpperCase();
+            }); 
+        }
         return map;
     }, [allUsers]);
 
@@ -119,12 +230,19 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             }
         });
         Object.values(scenarioNodes).forEach(node => {
-            const stepStates = (node.steps || []).map(stepId => drillExecData[stepId]);
-            if(stepStates.some(s => s?.status === 'InProgress')) node.executionStatus = 'InProgress';
-            else if (stepStates.every(s => s?.status?.startsWith('Completed'))) node.executionStatus = 'Completed';
-            else node.executionStatus = 'Pending';
+            const scenarioSummary = drillExecData[node.id];
+            if (scenarioSummary && scenarioSummary.final_status) {
+                 if (scenarioSummary.final_status === 'Success-Overridden' || scenarioSummary.final_status === 'Success') node.executionStatus = 'Completed';
+                 else if (scenarioSummary.final_status === 'Failure-Confirmed') node.executionStatus = 'Failed';
+                 else node.executionStatus = 'Pending'; 
+            } else {
+                const stepStates = (node.steps || []).map(stepId => drillExecData[stepId]);
+                if(stepStates.some(s => s?.status === 'InProgress')) node.executionStatus = 'InProgress';
+                else if (stepStates.length > 0 && stepStates.every(s => s?.status?.startsWith('Completed'))) node.executionStatus = 'Completed';
+                else node.executionStatus = 'Pending';
+            }
+
             if (node.checkpoint) {
-                // SỬA LỖI LOGIC: Đảm bảo drillExecData[c.id] tồn tại trước khi truy cập .status
                 const criteriaStates = (node.checkpoint.criteria || []).map(c => drillExecData[c.id]);
                 if (criteriaStates.every(s => s?.status)) { 
                     node.checkpoint.executionStatus = 'Completed'; 
@@ -139,12 +257,15 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             if (depIsScenario) {
                 const depNode = scenarioNodes[depId];
                 if (depNode.executionStatus !== 'Completed') return false; 
+                
                 const stepStates = (depNode.steps || []).map(stepId => drillExecData[stepId]?.status);
                 const hasFailure = stepStates.some(s => s === 'Completed-Failure' || s === 'Completed-Blocked');
                 const finalStatus = drillExecData[depId]?.final_status;
+                
                 if (finalStatus === 'Success-Overridden') return true;
                 if (finalStatus === 'Failure-Confirmed') return false;
                 if (hasFailure) return false;
+                
                 if (depNode.checkpoint && (depNode.checkpoint.executionStatus !== 'Completed' || !depNode.checkpoint.isPassed)) return false;
                 return true;
             }
@@ -167,7 +288,6 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
                 const stepStates = (node.steps || []).map(stepId => drillExecData[stepId]?.status);
                 const hasFailure = stepStates.some(s => s === 'Completed-Failure' || s === 'Completed-Blocked');
                 const finalStatus = drillExecData[node.id]?.final_status;
-                // SỬA LỖI LOGIC: Checkpoint bị khóa nếu kịch bản thất bại (kể cả khi đã ghi đè)
                 const scenarioFailed = hasFailure && finalStatus !== 'Success-Overridden';
                 node.checkpoint.isLocked = node.executionStatus !== 'Completed' || scenarioFailed || finalStatus === 'Failure-Confirmed';
             }
@@ -203,49 +323,22 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
 
     const activeNode = activeNodeId ? allNodes[activeNodeId] : null;
 
-    const onExecutionUpdate = useCallback((drillId, entityId, newData) => {
-        setExecutionData(prevExecData => {
-            const newDrillData = { ...(prevExecData[drillId] || {}) };
-            newDrillData[entityId] = newData;
-            return { ...prevExecData, [drillId]: newDrillData };
-        });
-    }, []); 
-
     const getStepState = (stepId) => (executionData && executionData[drillId] && executionData[drillId][stepId]) ? executionData[drillId][stepId] : { status: 'Pending' };
 
     // --- WebSocket Logic ---
     useEffect(() => {
         if (!drill) return; 
-        if (!isAutoRunning) {
-             if (ws.current) { 
-                 console.log("Auto-run is false. Closing WebSocket.");
-                 ws.current.onclose = null; 
-                 ws.current.close(); 
-                 ws.current = null; 
-             }
-            // SỬA LỖI: Luôn kết nối WebSocket (kể cả khi không auto-run)
-            // để nhận cập nhật từ người khác.
-            // Xóa: return;
-        }
         
-        // Sửa lỗi: Chỉ kết nối 1 lần, hoặc kết nối lại nếu bị ngắt
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-             // Đã kết nối, không làm gì cả
         } else {
-            console.log("Attempting WebSocket connection..."); // Debug
+            console.log("Attempting WebSocket connection...");
             const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
             const wsUrl = `${protocol}://${window.location.host}/ws/execution/${drill.id}`;
             ws.current = new WebSocket(wsUrl);
             ws.current.onopen = () => console.log("WebSocket connected");
             
-            ws.current.onclose = () => { 
-                console.warn("WebSocket disconnected."); 
-                ws.current = null; 
-            };
-            ws.current.onerror = (error) => { 
-                console.error("WebSocket error:", error); 
-                ws.current = null; // Đảm bảo đóng lại khi lỗi
-            };
+            ws.current.onclose = () => { console.warn("WebSocket disconnected."); ws.current = null; };
+            ws.current.onerror = (error) => { console.error("WebSocket error:", error); ws.current = null; };
         }
         
         ws.current.onmessage = (event) => {
@@ -255,36 +348,43 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
                     onExecutionUpdate(drillId, message.payload.step_id, message.payload); 
                     setFailedStepInfo(prev => (prev && message.payload.step_id === prev.stepId && (message.payload.status === 'Completed-Success' || message.payload.status === 'Completed-Skipped')) ? null : prev);
                     if (message.payload.status === 'Pending') setLiveLogs(prev => { const next = { ...prev }; delete next[message.payload.step_id]; return next; });
-                    if (message.payload.status !== 'InProgress') setAutoRunState(prev => ({ ...prev, runningSteps: prev.runningSteps.filter(id => id !== message.payload.step_id) }));
+                    
+                    if (message.payload.status === 'InProgress') {
+                        setAutoRunState(prev => ({ ...prev, runningSteps: [...new Set([...prev.runningSteps, message.payload.step_id])] }));
+                    } else {
+                        setAutoRunState(prev => ({ ...prev, runningSteps: prev.runningSteps.filter(id => id !== message.payload.step_id) }));
+                    }
                     break;
+
                 case 'SCENARIO_UPDATE':
                     onExecutionUpdate(drillId, message.payload.id, message.payload); 
                     break;
-                // --- START: SỬA LỖI CHECKPOINT (Thêm case còn thiếu) ---
                 case 'CRITERION_UPDATE':
-                    // Cập nhật trạng thái của criterion trong executionData
-                    // Hàm onExecutionUpdate sẽ tự động cập nhật state
                     onExecutionUpdate(drillId, message.payload.criterion_id, message.payload);
                     break;
-                // --- END: SỬA LỖI CHECKPOINT ---
+
                 case 'STEP_LOG_UPDATE':
-                    setLiveLogs(prev => ({ ...prev, [message.payload.step_id]: (prev[message.payload.step_id] || '') + message.payload.log_chunk }));
+                    const stepId = message.payload.step_id;
+                    
+                    // Cập nhật log cho mọi bước, không lọc theo kịch bản hiện tại
+                    setLiveLogs(prev => ({ 
+                        ...prev, 
+                        [stepId]: (prev[stepId] || '') + message.payload.log_chunk 
+                    }));
                     break;
+                    
                 case 'LEVEL_START':
                     setAutoRunState(prev => ({ ...prev, runningSteps: [...new Set([...prev.runningSteps, ...message.payload.step_ids])] }));
                     break;
+
                 case 'EXECUTION_PAUSED_ON_FAILURE':
                     setFailedStepInfo({ stepId: message.payload.step_id });
-                    setAutoRunState(prevState => ({ ...prevState, runningSteps: [] }));
-                    // XÓA: setIsAutoRunning(false); (Theo logic yêu cầu từ lần trước)
                     break;
+
                 case 'EXECUTION_COMPLETE':
-                    setIsAutoRunning(false); 
-                    setAutoRunState({ runningSteps: [] });
                     console.log("Thực thi kịch bản tự động hoàn tất!");
                     break;
                 case 'EXECUTION_ERROR':
-                    setIsAutoRunning(false);
                     setAutoRunState({ runningSteps: [] });
                     console.error(`Lỗi thực thi phía server: ${message.payload.error}`);
                     break;
@@ -293,22 +393,17 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             }
         };
 
-        // Sửa lỗi: Cần dọn dẹp websocket khi component bị unmount
         return () => {
             if (ws.current) {
                 console.log("Cleaning up WebSocket connection.");
-                ws.current.onclose = null; // Ngăn reconnect
+                ws.current.onclose = null;
                 ws.current.close();
                 ws.current = null;
             }
         };
 
-    // Sửa lỗi: Bỏ isAutoRunning khỏi dependency array
-    // để useEffect này chỉ chạy 1 lần và quản lý kết nối của chính nó
     }, [drill, onExecutionUpdate, drillId]);
-    // --- Kết thúc sửa lỗi WebSocket ---
 
-    // --- Permissions ---
     const scenarioIsAutomatic = activeNode && activeNode.nodeType === 'scenario' && activeNode.type === 'AUTOMATION';
     const hasExecutedSteps = activeNode && activeNode.steps && steps && Object.keys(steps).length > 0 && activeNode.steps.some(id => getStepState(id).status !== 'Pending');
 
@@ -319,32 +414,27 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             const isAssigned = (activeNode.steps || []).some(stepId => drill.step_assignments?.[stepId] === user.id);
             return isAssigned;
          }
-         // SỬA LỖI: Cho phép control Checkpoint nếu user là ADMIN hoặc được gán vào kịch bản TRƯỚC ĐÓ
          if (activeNode.nodeType === 'checkpoint') {
-             // Tìm kịch bản chứa checkpoint này
              const sourceScenario = Object.values(allNodes).find(n => n.nodeType === 'scenario' && n.checkpoint?.id === activeNode.id);
              if (sourceScenario) {
                  const isAssigned = (sourceScenario.steps || []).some(stepId => drill.step_assignments?.[stepId] === user.id);
                  return isAssigned;
              }
          }
-         return false; // Default
+         return false; 
      }, [activeNode, drill, user.id, user.role, allNodes]);
 
-    // --- Event Handlers ---
     const updateExecutionStep = async (payload) => {
         try {
             const response = await fetch('/api/ops/execution/step', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             if (!response.ok) throw new Error(await response.text());
             const updatedStep = await response.json();
-            // Client tự cập nhật state, không chờ WebSocket
             onExecutionUpdate(drill.id, updatedStep.step_id, updatedStep);
         } catch (error) { console.error("Lỗi cập nhật bước thực thi:", error); }
     };
 
     const handleEvaluateCriterion = async (criterionId, status) => {
         try {
-            // Đây là API đang bị 404
             const response = await fetch('/api/ops/execution/checkpoint', { 
                 method: 'POST', 
                 headers: { 'Content-Type': 'application/json' }, 
@@ -357,10 +447,8 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             });
             if (!response.ok) throw new Error(await response.text());
             const updatedCriterion = await response.json();
-            // Client tự cập nhật state ngay lập tức
             onExecutionUpdate(drill.id, updatedCriterion.criterion_id, updatedCriterion);
         } catch (error) { 
-            // Đây là nơi lỗi 404 đang bị bắt
             console.error("Lỗi đánh giá tiêu chí:", error); 
         }
     };
@@ -381,7 +469,6 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             const response = await fetch('/api/ops/execution/scenario', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drill_id: drill.id, scenario_id: scenId, final_status: finalStatus, final_reason: finalReason }) });
             if (!response.ok) throw new Error(await response.text());
             const confirmedScenario = await response.json();
-            // Client tự cập nhật state
             onExecutionUpdate(drill.id, confirmedScenario.scenario_id, { ...confirmedScenario, id: confirmedScenario.scenario_id, type: 'scenario' });
         } catch (error) { console.error("Lỗi xác nhận kịch bản:", error); }
     };
@@ -402,42 +489,63 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
             if (stepsToRun.length === 0) return;
 
             const scenarioSteps = activeNode.steps.map(id => steps[id]).filter(Boolean);
-            const stepIdSet = new Set(scenarioSteps.map(s => s.id));
-            const inDegree = {};
-            scenarioSteps.forEach(s => { inDegree[s.id] = 0; });
-            scenarioSteps.forEach(s => { (s.dependsOn || []).forEach(depId => { if (stepIdSet.has(depId)) inDegree[s.id]++; }); });
-            const firstLevelStepIds = scenarioSteps.filter(s => inDegree[s.id] === 0).map(s => s.id);
+            const firstLevelStepIds = scenarioSteps.filter(s => true).map(s => s.id); 
             
-            setLiveLogs({});
+            // --- FIX QUAN TRỌNG ---
+            // Chỉ xóa log của các bước thuộc kịch bản này, không xóa log của kịch bản khác
+            setLiveLogs(prev => {
+                const next = { ...prev };
+                // Xóa log của các bước sắp chạy để clear màn hình
+                if (activeNode.steps) {
+                    activeNode.steps.forEach(id => delete next[id]);
+                }
+                return next;
+            });
+            
             const response = await fetch(`/api/ops/execution/scenario/${activeNode.id}/rerun`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drill_id: drill.id, steps_to_run: stepsToRun }) });
-            if (!response.ok) throw new Error(await response.text());
             
-            setIsAutoRunning(true);
+            if (!response.ok) {
+                const errorText = await response.text();
+                if (errorText.includes("EXECUTION_ALREADY_ACTIVE")) {
+                     console.warn("Kịch bản đang được chạy bởi người khác. Đồng bộ trạng thái...");
+                     fetchExecutionData();
+                     return;
+                }
+                throw new Error(errorText);
+            }
+            
             setFailedStepInfo(null);
-            setAutoRunState(prev => ({ ...prev, runningSteps: [...new Set([...prev.runningSteps, ...firstLevelStepIds])] }));
-            if (firstLevelStepIds.length > 0) setSelectedStepId(firstLevelStepIds[0]);
-        } catch (error) { console.error("Lỗi bắt đầu thực thi tự động:", error); }
+        } catch (error) { 
+            console.error("Lỗi bắt đầu thực thi tự động:", error); 
+            setError(error.message);
+        }
     };
 
+    // --- FIX ESLINT: Đã thêm tham số stepsToRerun vào hàm ---
     const handleRerun = async (stepsToRerun) => {
         try {
             if (!activeNode || activeNode.nodeType !== 'scenario') return;
-            const stepsToRerunObjects = stepsToRerun.map(id => steps[id]).filter(Boolean);
-            const stepsToRerunIdSet = new Set(stepsToRerun);
-            const inDegree = {};
-            stepsToRerunObjects.forEach(s => { inDegree[s.id] = 0; });
-            stepsToRerunObjects.forEach(s => { (s.dependsOn || []).forEach(depId => { if (stepsToRerunIdSet.has(depId)) inDegree[s.id]++; }); });
-            const firstLevelRerunStepIds = stepsToRerunObjects.filter(s => inDegree[s.id] === 0).map(s => s.id);
-
-            setLiveLogs(prev => { const next = { ...prev }; stepsToRerun.forEach(id => delete next[id]); return next; });
-            const response = await fetch(`/api/ops/execution/scenario/${activeNode.id}/rerun`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drill_id: drill.id, steps_to_run: stepsToRerun }) });
-            if (!response.ok) throw new Error(await response.text());
             
-            setIsAutoRunning(true);
+            // Chỉ xóa log của các bước được chọn chạy lại
+            setLiveLogs(prev => { const next = { ...prev }; stepsToRerun.forEach(id => delete next[id]); return next; });
+            
+            const response = await fetch(`/api/ops/execution/scenario/${activeNode.id}/rerun`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drill_id: drill.id, steps_to_run: stepsToRerun }) });
+            
+            if (!response.ok) {
+                 const errorText = await response.text();
+                 if (errorText.includes("EXECUTION_ALREADY_ACTIVE")) {
+                     console.warn("Kịch bản đang được chạy lại bởi người khác. Đồng bộ trạng thái...");
+                     fetchExecutionData();
+                     return;
+                 }
+                 throw new Error(errorText);
+            }
+            
             setFailedStepInfo(null);
-            setAutoRunState(prev => ({ ...prev, runningSteps: [...new Set([...prev.runningSteps, ...firstLevelRerunStepIds])] }));
-            if (firstLevelRerunStepIds.length > 0) setSelectedStepId(firstLevelRerunStepIds[0]);
-        } catch (error) { console.error("Lỗi yêu cầu chạy lại:", error); }
+        } catch (error) { 
+            console.error("Lỗi yêu cầu chạy lại:", error); 
+            setError(error.message);
+        }
     };
 
     const handleOverrideStep = async (stepId, newStatus) => {
@@ -465,6 +573,7 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
         allUsers,
         executionData,
         isLoading,
+        isLoadingDetails,
         error,
         activeNodeId,
         setActiveNodeId,
@@ -483,6 +592,7 @@ export const useExecutionState = ({ user, drillId, drillBasicInfo, onDrillEnded,
         setRefreshInterval,
         handleRefresh,
         userColorMap,
+        userAvatarLabels, // FIX: Export userAvatarLabels để ExecutionScreen sử dụng
         groupLevels,
         allNodes,
         activeNode,

@@ -12,7 +12,8 @@ const {
     sendWsMessage, 
     updateManualStep,
     confirmScenarioStatus,
-    evaluateCheckpointCriterion // <-- Đã thêm import cho checkpoint
+    evaluateCheckpointCriterion, // <-- Đã thêm import cho checkpoint
+    getScenarioDetails // <-- THÊM IMPORT NÀY CHO LAZY LOADING
 } = require('./execution');
 // --- END: SỬA LỖI API (FIX LỖI 404) ---
 const router = express.Router();
@@ -1039,5 +1040,19 @@ router.post('/execution/checkpoint', async (req, res) => {
     }
 });
 // --- END: THÊM ROUTE CHO CHECKPOINT (ĐÃ SỬA LỖI) ---
+
+// --- THÊM ROUTE CHO LAZY LOADING (DETAILS) ---
+router.get('/drills/:drillId/scenarios/:scenarioId/details', async (req, res) => {
+    try {
+        const { drillId, scenarioId } = req.params;
+        // Gọi hàm getScenarioDetails từ execution.js để lấy dữ liệu merged (DB + Memory)
+        const details = await getScenarioDetails(drillId, scenarioId);
+        res.json(details);
+    } catch (error) {
+        console.error("Error fetching scenario details:", error);
+        res.status(500).json({ message: "Lỗi server khi lấy chi tiết kịch bản." });
+    }
+});
+// --- END: THÊM ROUTE CHO LAZY LOADING ---
 
 module.exports = router;

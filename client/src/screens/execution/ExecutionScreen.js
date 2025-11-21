@@ -10,7 +10,8 @@ import {
     LockIcon,
     LinkIcon,
     StepSpinner,
-    userColorClasses
+    userColorClasses,
+    ClockIcon
 } from './ExecutionMocksAndUtils.js';
 
 // Import các component con (Modals, Views)
@@ -52,7 +53,10 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
         refreshInterval,
         setRefreshInterval,
         handleRefresh,
-        userColorMap,
+        // --- FIX CRITICAL: Thêm giá trị mặc định = {} để tránh lỗi "Cannot read properties of undefined" ---
+        userColorMap = {}, 
+        userAvatarLabels = {}, 
+        // ---------------------------------------------------------------------------------------------
         groupLevels,
         allNodes,
         activeNode,
@@ -80,7 +84,6 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
          return <div className="p-4 text-center text-red-500">{t('errorDrillNotFound', 'Không tìm thấy dữ liệu diễn tập.')}</div>;
     }
     
-    // --- Lấy thông tin cho Modals (từ logic của hook) ---
     const failedStepTitle = failedStepInfo?.stepId ? (steps[failedStepInfo.stepId]?.title || t('unknownStep', 'Bước không xác định')) : null;
 
     // --- JSX (Phần giao diện) ---
@@ -93,20 +96,16 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
                         refreshInterval={refreshInterval}
                         setRefreshInterval={setRefreshInterval}
                         onRefresh={handleRefresh}
-                        // SỬA LỖI: Vô hiệu hóa nút Refresh nếu đang isLoading HOẶC đang chạy tự động
                         isLoading={isLoading || isAutoRunning}
                         t={t}
                     />
                 </div>
 
-                {/* --- SỬA LỖI: Thêm tiêu đề (Tên Drill) --- */}
                 {drill && (
                     <h1 className="text-3xl font-bold text-gray-800 tracking-tight">
                         {drill.name}
                     </h1>
                 )}
-                {/* --- Kết thúc sửa lỗi --- */}
-
 
                 <div className="bg-white p-4 rounded-xl shadow-lg">
                     <h2 className="text-lg font-bold text-gray-900 mb-4 text-center">{t('scenarios')}</h2>
@@ -180,6 +179,10 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
                                                                             else if (hasFailedStep) statusOverlayIcon = <XCircleIcon className="w-6 h-6 text-red-500" />;
                                                                             else if (hasSkippedStep) statusOverlayIcon = <CheckCircleIcon className="w-6 h-6 text-yellow-500" />;
                                                                             else statusOverlayIcon = <CheckCircleIcon className="w-6 h-6 text-green-500" />;
+                                                                        } else if (node.executionStatus === 'Failed') {
+                                                                            statusOverlayIcon = <XCircleIcon className="w-6 h-6 text-red-500" />;
+                                                                        } else {
+                                                                            statusOverlayIcon = <ClockIcon className="w-6 h-6 text-gray-400" />;
                                                                         }
 
                                                                         return (
@@ -205,8 +208,19 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
                                                                                 <div className="relative z-10 mt-2"> <span className={`text-xs px-1.5 py-0-5 rounded-full font-semibold ${node.role === 'TECHNICAL' ? 'bg-purple-100 text-purple-800' : 'bg-orange-100 text-orange-800'}`}>{node.role}</span> </div>
                                                                                 {assignedUsers.length > 0 && (
                                                                                     <div className="absolute z-20 bottom-2 right-2 flex flex-row-reverse items-center -space-x-2 space-x-reverse">
-                                                                                        {assignedUsers.slice(0, 2).map(u => { const colorStyle = userColorMap[u.id] || userColorClasses[0]; const fullName = u.last_name && u.first_name ? `${u.last_name} ${u.first_name}` : (u.fullname || u.username); const nameParts = fullName ? fullName.split(' ').filter(p => p) : []; const lastName = nameParts.length > 0 ? nameParts[nameParts.length - 1] : ''; const avatarText = (lastName ? lastName.charAt(0) : (u.username?.[0] || 'U')).toUpperCase(); return <div key={u.id} className={`w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold ring-1 ring-white ${colorStyle.bg} ${colorStyle.text}`} title={fullName}>{avatarText}</div>; })}
-                                                                                        {assignedUsers.length > 2 && <div className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold ring-1 ring-white bg-gray-200 text-gray-700" title={`${assignedUsers.length - 2} người khác`}>+{assignedUsers.length - 2}</div>}
+                                                                                        {assignedUsers.slice(0, 2).map(u => { 
+                                                                                            // FIX: Kiểm tra kỹ userColorMap và userAvatarLabels trước khi truy cập
+                                                                                            const colorStyle = (userColorMap && userColorMap[u.id]) || userColorClasses[0]; 
+                                                                                            const fullName = u.fullname || u.username;
+                                                                                            const avatarText = (userAvatarLabels && userAvatarLabels[u.id]) || '?';
+                                                                                            
+                                                                                            return (
+                                                                                                <div key={u.id} className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ring-1 ring-white ${colorStyle.bg} ${colorStyle.text} shadow-sm`} title={fullName}>
+                                                                                                    {avatarText}
+                                                                                                </div>
+                                                                                            ); 
+                                                                                        })}
+                                                                                        {assignedUsers.length > 2 && <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ring-1 ring-white bg-gray-200 text-gray-700 shadow-sm" title={`${assignedUsers.length - 2} người khác`}>+{assignedUsers.length - 2}</div>}
                                                                                     </div>
                                                                                 )}
                                                                             </button>
@@ -255,6 +269,7 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
                             rerunModalOpen={rerunModalOpen}
                             onStartAutoRun={handleStartAutoRun}
                             onRerunClick={() => setRerunModalOpen(true)}
+                            userAvatarLabels={userAvatarLabels} // Pass prop này vào detail view nếu cần
                         />
                     ) : (
                         <div className="flex items-center justify-center min-h-[200px]">
@@ -286,7 +301,6 @@ const ExecutionScreen = ({ user, drillId, drillBasicInfo, onBack, onDrillEnded, 
                 )}
             </div>
 
-            {/* --- Modals --- */}
             {completionModal && (
                  <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
                     <CompletionModal
